@@ -143,6 +143,20 @@ const ORPHAN_REF_CLOSE = new RegExp("(?<![\\w>])" + REFS_RUN + "\\s*\x3c\\/" + N
 // preceding an unmatched close (whole-text orphan pass).
 const ORPHAN_RUN_BEFORE = new RegExp("(?<![\\w>])" + REFS_RUN + "\\s*$");
 const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
+// An attrs-bearing opening that never closes carries the ref run it echoed as
+// its own content; the model's answer follows that run
+// (`<acp tokens="31" type="text">m00039\n子作成完了`). The opening goes WITH
+// its run in both modes — whole-text matches the pair below, streaming splits
+// the swallowed tail with OPEN_TAIL_REFS — so neither the ref leaks nor the
+// answer is dropped as tag content. A run that a close head follows belongs to
+// that close (DEAD_REF_CLOSE / DEGEN_PAIR, #2862/#2190) and is left to it.
+const ATTRS_OPEN_REFS = new RegExp("\x3c" + NAME + "\\s[^<>]*>\\s*" + REFS_RUN + "(?!\\w|\\s*\x3c\\/)");
+const OPEN_TAIL_REFS = new RegExp("^\\s*" + REFS_RUN + "(?!\\w|\\s*\x3c\\/)");
+// The run followed by a tag NAME still being written (`<`, `</`, `</ac`):
+// whether it is that run's close or a new opening decides OPEN_TAIL_REFS, so
+// the verdict waits. Only the name — a malformed close never gets its `>`
+// (`</acp这是…`, #644) and must not hold the answer behind it.
+const OPEN_TAIL_REFS_PENDING_TAG = new RegExp("^\\s*" + REFS_RUN + "\\s*\x3c\\/?[A-Za-z0-9]{0,16}$");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // #2190: a ref body closed by a DEGENERATE close name (any short word — the
 // drift set is open; the attested census alone has p/a/ap/apc/cap/ck/div/
@@ -488,6 +502,7 @@ function stripPass(text: string, dropToolCallEmission: boolean, requestText: str
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(DEGEN_PAIR, "")
         .replace(new RegExp(SELF_CLOSE.source, "g"), "")
+        .replace(new RegExp(ATTRS_OPEN_REFS.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(MANGLED_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
@@ -1075,6 +1090,14 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
         }
         recordDrop(snippet);
     };
+    /** The swallowed tail of an attrs-bearing opening, minus the ref run that
+     *  is the opening's own content (ATTRS_OPEN_REFS). */
+    const dropOpenTailRefs = (s: string): string => {
+        const m = OPEN_TAIL_REFS.exec(s);
+        if (m === null) return s;
+        dropSwallowSpan(m[0]);
+        return s.slice(m[0].length);
+    };
     /** #2862: strip dead ref-close units (ref + unterminated close head) from
      *  a span about to be RELEASED as prose; each unit is one self-contained
      *  artifact. Only when a tag-echo is already attested in this response
@@ -1176,11 +1199,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     // close goes — a ref cited inside such a body survives.
                     // An attested imitation (swallowReleases=false) discards
                     // whatever the body is.
-                    const inner = combined.slice(0, span.start);
+                    let inner = combined.slice(0, span.start);
                     if (REFS_ONLY.test(inner) || !swallowReleases) {
                         dropSwallowSpan(combined.slice(0, span.end));
                         buf = combined.slice(span.end);
                     } else {
+                        if (!swallowBareOpen) inner = dropOpenTailRefs(inner);
                         // #4169: the body is released as prose, but its own
                         // tag-shaped echoes take the SAME verdicts as any other
                         // text — whole-text strips a nested bare open inside an
@@ -1195,7 +1219,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         const t = TRUNC_OPEN.exec(inner);
                         if (t !== null) {
                             out += stripDeadRefCloses(inner.slice(0, t.index));
-                            dropSwallowSpan(combined.slice(t.index, span.end));
+                            dropSwallowSpan(inner.slice(t.index) + combined.slice(span.start, span.end));
                             buf = combined.slice(span.end);
                         } else {
                             dropSwallowSpan(combined.slice(span.start, span.end));
@@ -1224,7 +1248,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         // semantics (existing contract: prose flows, and the
                         // EOF flush of a never-closed attrs-bearing span is
                         // tag content, not prose).
-                        if (PENDING_REF_SPAN.test(combined)) {
+                        if (PENDING_REF_SPAN.test(combined) || (!swallowBareOpen && OPEN_TAIL_REFS_PENDING_TAG.test(combined))) {
                             if (combined.length <= IMITATION_SWALLOW_CAP) {
                                 swallowed = combined;
                                 return out;
@@ -1236,8 +1260,8 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         }
                         swallowed = "";
                         swallowUntilClose = false;
-                        buf = combined;
-                        if (onResidueWarn && containsEchoResidue(combined)) onResidueWarn(combined);
+                        buf = swallowBareOpen ? combined : dropOpenTailRefs(combined);
+                        if (onResidueWarn && containsEchoResidue(buf)) onResidueWarn(buf);
                         continue;
                     }
                     // The span is an attested imitation's payload: discard it and
@@ -1510,14 +1534,25 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // #2862: dead ref-close units die before the truncate branches —
             // TRUNC_CLOSE would otherwise eat the \x3c/name tail at EOF and
             // shadow the unit down to a bare ref (#2348 v4 ordering).
-            const rest = stripDeadRefCloses(preHeld + swallowed + held);
+            let rest = stripDeadRefCloses(preHeld + swallowed + held);
             const wasSwallowing = swallowUntilClose;
             preHeld = "";
             swallowed = "";
             held = "";
             swallowUntilClose = false;
             let result: string;
-            if (wasSwallowing && (!swallowReleases || !swallowBareOpen)) {
+            // An attrs-bearing tail that runs past its own ref run is that
+            // opening's answer, not tag content: it takes the bare-release
+            // verdicts below (ATTRS_OPEN_REFS keeps whole-text in step).
+            let attrsAnswer = false;
+            if (wasSwallowing && swallowReleases && !swallowBareOpen && !PENDING_REF_SPAN.test(rest)) {
+                const head = OPEN_TAIL_REFS.exec(rest);
+                if (head !== null && /\S/.test(rest.slice(head[0].length))) {
+                    rest = dropOpenTailRefs(rest);
+                    attrsAnswer = true;
+                }
+            }
+            if (wasSwallowing && (!swallowReleases || (!swallowBareOpen && !attrsAnswer))) {
                 // Stream ended inside an unclosed render tag: a wrapped-turn
                 // imitation (never released, #1720), or an attrs-bearing
                 // opening whose tail never closed — that tail is tag content
@@ -1556,11 +1591,22 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                             const emitted = process(payload);
                             if (emitted.length > 0) lastEmitted = emitted[emitted.length - 1];
                             r += emitted;
+                            const nestedAttrs = swallowUntilClose && swallowReleases && !swallowBareOpen;
                             payload = preHeld + swallowed + held;
                             preHeld = "";
                             swallowed = "";
                             held = "";
                             swallowUntilClose = false;
+                            if (nestedAttrs) {
+                                // A stacked attrs-bearing opening inside the
+                                // released answer: same EOF rule as the outer one.
+                                const head = OPEN_TAIL_REFS.exec(payload);
+                                if (PENDING_REF_SPAN.test(payload) || head === null || !/\S/.test(payload.slice(head[0].length))) {
+                                    if (payload.length > 0) dropSwallowSpan(payload);
+                                    break;
+                                }
+                                payload = dropOpenTailRefs(payload);
+                            }
                             if (payload === "") break;
                             const t2 = new RegExp(TRUNC_OPEN.source).exec(payload);
                             if (t2 !== null) {
